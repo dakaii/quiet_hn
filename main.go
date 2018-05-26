@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gophercises/quiet_hn/hn"
@@ -31,9 +32,30 @@ func main() {
 }
 
 func handler(numStories int, tpl *template.Template) http.HandlerFunc {
+	sc := storyCache{
+		numStories: numStories,
+		duration:   6 * time.Second,
+	}
+
+	go func() {
+		ticker := time.NewTicker(3 * time.Second)
+		for {
+			temp := storyCache{
+				numStories: numStories,
+				duration:   6 * time.Second,
+			}
+			temp.stories()
+			sc.mutex.Lock()
+			sc.cache = temp.cache
+			sc.expiration = temp.expiration
+			sc.mutex.Unlock()
+			<-ticker.C
+		}
+	}()
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
-		stories, err := getTopStories(numStories)
+		stories, err := sc.stories()
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -50,20 +72,55 @@ func handler(numStories int, tpl *template.Template) http.HandlerFunc {
 	})
 }
 
+type storyCache struct {
+	numStories int
+	cache      []item
+	expiration time.Time
+	duration   time.Duration
+	mutex      sync.Mutex
+}
+
+func (sc *storyCache) stories() ([]item, error) {
+	sc.mutex.Lock()
+	defer sc.mutex.Unlock()
+	if time.Now().Sub(sc.expiration) < 0 {
+		return sc.cache, nil
+	}
+	stories, err := getTopStories(sc.numStories)
+	if err != nil {
+		return nil, err
+	}
+	sc.expiration = time.Now().Add(sc.duration)
+	sc.cache = stories
+	return stories, nil
+}
+
 func getTopStories(numStories int) ([]item, error) {
 	var client hn.Client
 	ids, err := client.TopItems()
 	if err != nil {
 		return nil, errors.New("Failed to load top stories")
 	}
+	var stories []item
+	at := 0
+	for len(stories) < numStories {
+		need := (numStories - len(stories)) * 5 / 4
+		stories = append(stories, getStories(ids[at:at+need])...)
+		at += need
+	}
+	return stories[:numStories], nil
+}
+
+func getStories(ids []int) []item {
 	type result struct {
 		idx  int
 		item item
 		err  error
 	}
 	resultCh := make(chan result)
-	for i := 0; i < numStories; i++ {
+	for i := 0; i < len(ids); i++ {
 		go func(idx int, id int) {
+			var client hn.Client
 			hnItem, err := client.GetItem(id)
 			if err != nil {
 				resultCh <- result{idx: idx, err: err}
@@ -72,7 +129,7 @@ func getTopStories(numStories int) ([]item, error) {
 		}(i, ids[i])
 	}
 	var results []result
-	for i := 0; i < numStories; i++ {
+	for i := 0; i < len(ids); i++ {
 		results = append(results, <-resultCh)
 	}
 	sort.Slice(results, func(i, j int) bool {
@@ -88,7 +145,7 @@ func getTopStories(numStories int) ([]item, error) {
 			stories = append(stories, res.item)
 		}
 	}
-	return stories, nil
+	return stories
 }
 
 func isStoryLink(item item) bool {
